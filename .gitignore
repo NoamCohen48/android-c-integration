@@ -1,0 +1,6 @@
+# C++ / CMake build output
+lib/build/
+build/
+
+# OS / editor
+.DS_Store

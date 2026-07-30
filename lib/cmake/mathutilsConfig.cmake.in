@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+# Package config for mathutils. Enables `find_package(mathutils)` in downstream
+# projects, exposing the imported target `mathutils::mathutils`.
+
+include("${CMAKE_CURRENT_LIST_DIR}/mathutilsTargets.cmake")
+
+check_required_components(mathutils)
