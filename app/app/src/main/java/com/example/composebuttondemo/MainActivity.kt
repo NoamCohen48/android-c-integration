@@ -19,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.composebuttondemo.ui.theme.ComposeButtonDemoTheme
@@ -39,7 +40,16 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun CounterScreen(modifier: Modifier = Modifier) {
-    var count by remember { mutableIntStateOf(0) }
+    // The number we probe with the native library; advances on each tap.
+    var n by remember { mutableIntStateOf(1) }
+
+    // The native .so isn't available to Android Studio's preview renderer, so
+    // skip the JNI calls when inspecting and show placeholders instead.
+    val inspecting = LocalInspectionMode.current
+
+    // Both values below are computed in C++ (mathutils) via JNI/SWIG.
+    val isPrime = if (inspecting) false else MathUtils.isPrime(n.toLong())
+    val primes = if (inspecting) emptyList() else MathUtils.primesUpTo(n.toLong())
 
     Column(
         modifier = modifier.fillMaxSize(),
@@ -47,14 +57,24 @@ fun CounterScreen(modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "You tapped $count ${if (count == 1) "time" else "times"}",
-            style = MaterialTheme.typography.headlineSmall
+            text = "n = $n",
+            style = MaterialTheme.typography.headlineMedium
+        )
+        Text(
+            text = "is_prime(n) = $isPrime",
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+        Text(
+            text = "primes ≤ n = ${primes.joinToString(", ").ifEmpty { "—" }}",
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(top = 4.dp)
         )
         Button(
-            onClick = { count++ },
-            modifier = Modifier.padding(top = 16.dp)
+            onClick = { n++ },
+            modifier = Modifier.padding(top = 24.dp)
         ) {
-            Text("Tap me")
+            Text("Next number (run C++)")
         }
     }
 }
