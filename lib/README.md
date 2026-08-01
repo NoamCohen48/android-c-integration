@@ -25,6 +25,9 @@ lib/
 │   ├── arithmetic/basic.cpp
 │   ├── combinatorics/factorial.cpp
 │   └── primes/{primality,sieve}.cpp
+├── bindings/java/                       # SWIG Java/JNI binding (see its README)
+│   ├── CMakeLists.txt                   # libmathutils_jni + SWIG generation
+│   └── mathutils.i                      # SWIG interface (generated/ is ignored)
 ├── demo/                                # mathutils_demo executable
 │   ├── CMakeLists.txt
 │   └── main.cpp
@@ -81,3 +84,16 @@ Or vendor it directly:
 add_subdirectory(lib)
 target_link_libraries(my_app PRIVATE mathutils::mathutils)
 ```
+
+## Using it from Java / Android
+
+`bindings/java/` holds the SWIG interface that turns the public headers into
+Java proxies plus a JNI wrapper (`libmathutils_jni`). It builds standalone:
+
+```sh
+cmake -S lib/bindings/java -B lib/bindings/java/build -DMATHUTILS_JAVA_BUILD_JAR=ON
+cmake --build lib/bindings/java/build
+```
+
+The Android app in `app/` consumes that same binding project rather than
+carrying its own copy. See `lib/bindings/java/README.md`.

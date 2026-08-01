@@ -23,6 +23,27 @@ generated halves that must agree exactly:
 
 Both are generated from a single interface file, so they cannot drift.
 
+## Where the binding lives
+
+Everything SWIG needs and produces is plain, app-agnostic Java and C++, so it
+lives **with the library**, in `lib/bindings/java/`, not in the app:
+
+```
+lib/bindings/java/
+├── CMakeLists.txt      # SWIG generation + libmathutils_jni (+ optional jar)
+├── mathutils.i         # the hand-written interface
+└── generated/          # git-ignored SWIG output
+    ├── java/com/example/mathutils/*.java
+    └── cpp/mathutils_wrap.cxx
+```
+
+That project builds on its own — `cmake -S lib/bindings/java -B <build>` runs
+SWIG, compiles `libmathutils_jni.so` against the host JDK's `jni.h`, and with
+`-DMATHUTILS_JAVA_BUILD_JAR=ON` also produces `mathutils.jar` usable from any
+JVM program. The Android app is just one consumer of it: it points
+`externalNativeBuild` at the same `CMakeLists.txt` and adds `generated/java` to
+its source set. See `lib/bindings/java/README.md`.
+
 ## Runtime call path (what happens on a button tap)
 
 ```
@@ -42,7 +63,7 @@ symbols exist.
 
 ## Layer by layer
 
-### 1. The SWIG interface — `app/app/src/main/cpp/mathutils.i`
+### 1. The SWIG interface — `lib/bindings/java/mathutils.i`
 
 The only hand-written file describing the binding. Key parts:
 
@@ -110,8 +131,8 @@ and both must wait for SWIG. It is wired so SWIG runs exactly **once**.
 
 An `Exec` task that runs the `swig` command, writing:
 
-- Java proxies -> `app/app/build/generated/swig/java/com/example/mathutils/`
-- C++ wrapper -> `app/app/build/generated/swig/cpp/mathutils_wrap.cxx`
+- Java proxies -> `lib/bindings/java/generated/java/com/example/mathutils/`
+- C++ wrapper -> `lib/bindings/java/generated/cpp/mathutils_wrap.cxx`
 
 It declares `inputs` (the `.i` file, the lib headers) and `outputs`, so Gradle
 caches it and only reruns when those change.
@@ -123,22 +144,25 @@ the module's sources, so `MathNative` / `LongVector` compile alongside the Kotli
 
 ### Feeding the C++ compiler — `externalNativeBuild` + `CMakeLists.txt`
 
-`android.externalNativeBuild.cmake.path` points at `src/main/cpp/CMakeLists.txt`,
-which:
+`android.externalNativeBuild.cmake.path` points at the library's own bindings
+project, `lib/bindings/java/CMakeLists.txt`, which:
 
-- receives two absolute paths from Gradle via `cmake.arguments`:
-  `-DMATHUTILS_LIB_DIR` (the `lib/` folder) and `-DSWIG_WRAP_CXX` (the generated
-  wrapper).
-- `add_subdirectory(${MATHUTILS_LIB_DIR} ...)` pulls the library in **unchanged**,
-  with `MATHUTILS_BUILD_DEMO/TESTS=OFF` (the lib's `install()` rules are guarded
-  by `PROJECT_IS_TOP_LEVEL`, so they stay off here too).
+- receives one argument from Gradle via `cmake.arguments`:
+  `-DMATHUTILS_JAVA_RUN_SWIG=OFF` (Gradle has already run SWIG; see *Ordering*).
+  No paths are passed — the bindings project knows where `lib/` and its own
+  `generated/` folder are, because it sits inside the library.
+- `add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. ...)` pulls the library in
+  **unchanged**, with `MATHUTILS_BUILD_DEMO/TESTS=OFF` (the lib's `install()`
+  rules are guarded by `PROJECT_IS_TOP_LEVEL`, so they stay off here too).
 - `set_source_files_properties(... GENERATED TRUE)` tells CMake the wrapper is
   produced externally, so the *configure* step does not fail when the file does
   not yet exist.
-- `add_library(mathutils_jni SHARED ${SWIG_WRAP_CXX})` +
-  `target_link_libraries(... mathutils::mathutils log)` produces the `.so`.
+- `add_library(mathutils_jni SHARED ${MATHUTILS_JAVA_WRAP_CXX})` +
+  `target_link_libraries(... mathutils::mathutils)` produces the `.so`.
   Linking `mathutils::mathutils` propagates its public include dirs and its
-  `cxx_std_17` requirement to the wrapper automatically.
+  `cxx_std_17` requirement to the wrapper automatically. `log` is linked only
+  `if(ANDROID)`; on a host build the JDK's `jni.h` is found with
+  `find_package(JNI)` instead, so the same project also builds off-Android.
 
 ### Ordering
 
@@ -158,9 +182,11 @@ So `configureCMakeDebug[abi]`, `buildCMakeDebug[abi]`, `compileDebugKotlin`, and
 
 `ndk { abiFilters += listOf("arm64-v8a", "x86_64") }` builds the `.so` twice —
 once per CPU architecture (real devices vs. emulator). The native build runs
-per-ABI, but SWIG runs only once because it is decoupled into the Gradle task,
-not driven by CMake — so there is no race regenerating the Java from parallel
-ABI builds.
+per-ABI, but SWIG runs only once because Gradle drives it and passes
+`-DMATHUTILS_JAVA_RUN_SWIG=OFF` to CMake — so there is no race regenerating the
+same Java from parallel ABI builds. (Standalone, off Android, that option
+defaults to `ON` and CMake generates the bindings itself; there is only one
+"ABI" then, so nothing races.)
 
 ### Toolchain pointers
 
@@ -183,47 +209,31 @@ indirections:
 `app/app/build.gradle.kts`:
 
 ```kotlin
+val bindingsDir = rootProject.projectDir.resolve("../lib/bindings/java")
+
 android {
     externalNativeBuild {
         cmake {
-            path = file("src/main/cpp/CMakeLists.txt")   // the entry point
+            path = bindingsDir.resolve("CMakeLists.txt")  // lib/bindings/java
         }
     }
 }
 ```
 
+`rootProject.projectDir` is `android-c/app` (the Gradle root), so
+`../lib/bindings/java` resolves to `android-c/lib/bindings/java`.
 `externalNativeBuild.cmake.path` is the one thing connecting the Gradle world to
-the CMake world.
+the CMake world — and it is the *only* path the app knows.
 
-**Hop 2 — that CMakeLists is told where `lib/` is, via a variable.** The app's
-CMakeLists does not contain a path to `lib/`; Gradle passes it in as a `-D`
-argument:
-
-```kotlin
-val libRootDir = rootProject.projectDir.resolve("../lib")   // android-c/app + ../lib = android-c/lib
-...
-defaultConfig {
-    externalNativeBuild {
-        cmake {
-            arguments += listOf(
-                "-DMATHUTILS_LIB_DIR=${libRootDir.absolutePath}",
-                "-DSWIG_WRAP_CXX=${swigCppFile.get().asFile.absolutePath}",
-            )
-        }
-    }
-}
-```
-
-`rootProject.projectDir` is `android-c/app` (the Gradle root), so `../lib`
-resolves to `android-c/lib`, made absolute. That value arrives in CMake as
-`${MATHUTILS_LIB_DIR}`.
-
-**Hop 3 — CMake pulls the library in and reads *its* file list.** In
-`app/app/src/main/cpp/CMakeLists.txt`:
+**Hop 2 — that CMakeLists finds `lib/` relative to itself.** Because the
+bindings project lives inside the library, it needs nothing passed in:
 
 ```cmake
-add_subdirectory(${MATHUTILS_LIB_DIR} ${CMAKE_BINARY_DIR}/mathutils)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. ${CMAKE_BINARY_DIR}/mathutils)
 ```
+
+(Previously the app owned this CMakeLists and had to be handed
+`-DMATHUTILS_LIB_DIR`; moving the bindings into `lib/` removed that hop.)
 
 `add_subdirectory` runs `lib/`'s **own** CMake, which is what actually lists the
 sources (`lib/src/CMakeLists.txt`):
@@ -236,14 +246,13 @@ add_library(mathutils
     primes/sieve.cpp)
 ```
 
-So the authoritative source list lives with the library, not the app. The app
-only knows an absolute path to the library root; the library describes itself.
-The second argument to `add_subdirectory` (`${CMAKE_BINARY_DIR}/mathutils`) is
-required because `lib/` sits *outside* the app's source tree, so CMake needs a
-place to put its build outputs.
+So the authoritative source list lives with the library, not the app. The second
+argument to `add_subdirectory` (`${CMAKE_BINARY_DIR}/mathutils`) is required
+because `lib/` sits *outside* the bindings directory, so CMake needs a place to
+put its build outputs.
 
 ```
-build.gradle.kts  --path-->  app/.../cpp/CMakeLists.txt  --DMATHUTILS_LIB_DIR-->  lib/CMakeLists.txt  --lists-->  *.cpp
+build.gradle.kts  --path-->  lib/bindings/java/CMakeLists.txt  --add_subdirectory(../..)-->  lib/CMakeLists.txt  --lists-->  *.cpp
 ```
 
 ### "How" — AGP drives CMake with the NDK toolchain, once per ABI
@@ -284,8 +293,8 @@ The resulting `.so` files (one per ABI) are emitted under
 `stripDebugDebugSymbols` -> `packageDebug` collect and drop them into the APK at
 `lib/arm64-v8a/` and `lib/x86_64/`.
 
-In short: Gradle knows **where** through the `cmake.path` -> `-DMATHUTILS_LIB_DIR`
--> `add_subdirectory` chain, and **how** through the NDK toolchain file, ABI, and
+In short: Gradle knows **where** through the `cmake.path` -> `add_subdirectory`
+chain, and **how** through the NDK toolchain file, ABI, and
 platform flags AGP feeds to CMake — while the actual source list and compile
 flags stay owned by `lib/`'s own CMake.
 
@@ -307,8 +316,9 @@ cannot drift.
 
 | File                                                          | Purpose                                                          |
 | ------------------------------------------------------------- | --------------------------------------------------------------- |
-| `app/app/src/main/cpp/mathutils.i`                            | SWIG interface (the only hand-written binding description)       |
-| `app/app/src/main/cpp/CMakeLists.txt`                         | Builds `libmathutils_jni.so` from the wrapper + `lib/`           |
+| `lib/bindings/java/mathutils.i`                               | SWIG interface (the only hand-written binding description)       |
+| `lib/bindings/java/CMakeLists.txt`                            | Runs SWIG (standalone) and builds `libmathutils_jni.so` + `lib/` |
+| `lib/bindings/java/README.md`                                 | Building the binding without Android                             |
 | `app/app/build.gradle.kts`                                    | `generateSwig` task, NDK/CMake config, source set, task ordering |
 | `app/app/src/main/java/com/example/composebuttondemo/MathUtils.kt` | Idiomatic Kotlin facade over the SWIG proxies              |
 | `app/app/src/main/java/com/example/composebuttondemo/MainActivity.kt` | Button runs `is_prime` / `primes_up_to` in C++         |
@@ -336,8 +346,34 @@ To see exactly what SWIG produces, without Gradle:
 ```sh
 swig -c++ -java \
   -package com.example.mathutils \
-  -I lib/include \
+  -Ilib/include \
   -outdir /tmp/swig/java/com/example/mathutils \
   -o /tmp/swig/mathutils_wrap.cxx \
-  app/app/src/main/cpp/mathutils.i
+  lib/bindings/java/mathutils.i
 ```
+
+## Building the binding without Android
+
+The same binding builds and runs on a desktop JVM, which is the quickest way to
+check a change to `mathutils.i` without an emulator:
+
+```sh
+cmake -S lib/bindings/java -B lib/bindings/java/build -DMATHUTILS_JAVA_BUILD_JAR=ON
+cmake --build lib/bindings/java/build
+
+cat > T.java <<'JAVA'
+import com.example.mathutils.MathNative;
+public class T {
+    public static void main(String[] a) {
+        System.out.println(MathNative.is_prime(97) + " " + MathNative.primes_up_to(20));
+    }
+}
+JAVA
+javac -cp lib/bindings/java/build/mathutils.jar -d . T.java
+java -cp lib/bindings/java/build/mathutils.jar:. \
+     -Djava.library.path=lib/bindings/java/build T
+# true [2, 3, 5, 7, 11, 13, 17, 19]
+```
+
+Here CMake runs SWIG itself (`MATHUTILS_JAVA_RUN_SWIG` defaults to `ON`), finds
+`jni.h` via `find_package(JNI)`, and skips `-llog` since `ANDROID` is not set.

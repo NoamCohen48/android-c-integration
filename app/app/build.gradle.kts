@@ -7,27 +7,32 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// SWIG code generation: turns lib/ headers into a JNI wrapper (compiled into
-// libmathutils_jni.so by CMake) plus Java proxy classes in package
-// com.example.mathutils. Runs once, feeding both the native build and javac.
+// SWIG code generation. The binding (interface, generated Java proxies and
+// generated JNI wrapper) belongs to the C++ library, not to this app, so it all
+// lives under lib/bindings/java/. The app only *drives* the generator, so that
+// SWIG runs exactly once instead of once per ABI, and then consumes its two
+// halves: the Java proxies via javac and the .cxx via the native build.
 // ---------------------------------------------------------------------------
-val swigInterface = layout.projectDirectory.file("src/main/cpp/mathutils.i")
+val bindingsDir = rootProject.projectDir.resolve("../lib/bindings/java")
 val libIncludeDir = rootProject.projectDir.resolve("../lib/include")
-val libRootDir = rootProject.projectDir.resolve("../lib")
-val swigJavaDir = layout.buildDirectory.dir("generated/swig/java")
-val swigCppFile = layout.buildDirectory.file("generated/swig/cpp/mathutils_wrap.cxx")
+val swigInterface = bindingsDir.resolve("mathutils.i")
+val swigPackage = "com.example.mathutils"
+val swigJavaDir = bindingsDir.resolve("generated/java")
+val swigCppFile = bindingsDir.resolve("generated/cpp/mathutils_wrap.cxx")
 
 val generateSwig = tasks.register<Exec>("generateSwig") {
     group = "build"
-    description = "Generates the JNI wrapper and Java proxies from mathutils.i via SWIG."
+    description = "Generates the JNI wrapper and Java proxies from lib/bindings/java/mathutils.i via SWIG."
 
     inputs.file(swigInterface)
     inputs.dir(libIncludeDir)
     outputs.dir(swigJavaDir)
     outputs.file(swigCppFile)
 
-    val javaOutDir = swigJavaDir.get().dir("com/example/mathutils").asFile
-    val cppOut = swigCppFile.get().asFile
+    // Locals only: referencing script-level vals inside doFirst would capture
+    // the build script, which the configuration cache cannot serialize.
+    val javaOutDir = swigJavaDir.resolve(swigPackage.replace('.', '/'))
+    val cppOut = swigCppFile
     doFirst {
         javaOutDir.mkdirs()
         cppOut.parentFile.mkdirs()
@@ -36,11 +41,11 @@ val generateSwig = tasks.register<Exec>("generateSwig") {
     val swig = if (OperatingSystem.current().isWindows) "swig.exe" else "swig"
     commandLine(
         swig, "-c++", "-java",
-        "-package", "com.example.mathutils",
+        "-package", swigPackage,
         "-I${libIncludeDir.absolutePath}",
         "-outdir", javaOutDir.absolutePath,
         "-o", cppOut.absolutePath,
-        swigInterface.asFile.absolutePath,
+        swigInterface.absolutePath,
     )
 }
 
@@ -58,10 +63,9 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += listOf(
-                    "-DMATHUTILS_LIB_DIR=${libRootDir.absolutePath}",
-                    "-DSWIG_WRAP_CXX=${swigCppFile.get().asFile.absolutePath}",
-                )
+                // SWIG already ran once via :app:generateSwig; the per-ABI
+                // native builds must not race regenerating the same files.
+                arguments += "-DMATHUTILS_JAVA_RUN_SWIG=OFF"
             }
         }
         // Keep the demo lean: build for a real-device ABI and the emulator ABI.
@@ -70,9 +74,11 @@ android {
         }
     }
 
+    // The native build is the library's own JNI bindings project; it pulls in
+    // lib/ itself, so the app passes no paths of its own.
     externalNativeBuild {
         cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
+            path = bindingsDir.resolve("CMakeLists.txt")
         }
     }
 
@@ -96,7 +102,7 @@ android {
         compose = true
     }
 
-    // Compile the SWIG-generated Java proxies as part of the app.
+    // Compile the library's SWIG-generated Java proxies as part of the app.
     sourceSets["main"].java.srcDir(swigJavaDir)
 }
 

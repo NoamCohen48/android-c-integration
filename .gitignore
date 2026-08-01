@@ -2,5 +2,8 @@
 lib/build/
 build/
 
+# SWIG-generated bindings (regenerated from lib/bindings/java/mathutils.i)
+lib/bindings/java/generated/
+
 # OS / editor
 .DS_Store
