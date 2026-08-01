@@ -51,6 +51,23 @@ fun CounterScreen(modifier: Modifier = Modifier) {
     val isPrime = if (inspecting) false else MathUtils.isPrime(n.toLong())
     val primes = if (inspecting) emptyList() else MathUtils.primesUpTo(n.toLong())
 
+    // Same numbers, but pulled out of C++ through a callback: scan_primes()
+    // calls back into this lambda once per prime with a PrimeEvent struct, and
+    // we stop it early after three hits by returning false. Watch logcat for
+    // the C++ side's own log records (tag "mathutils.scan").
+    val firstThree = remember(n) {
+        if (inspecting) {
+            emptyList()
+        } else {
+            buildList {
+                MathUtils.scanPrimes(n.toLong()) { prime ->
+                    add(prime)
+                    size < 3
+                }
+            }
+        }
+    }
+
     Column(
         modifier = modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -67,6 +84,13 @@ fun CounterScreen(modifier: Modifier = Modifier) {
         )
         Text(
             text = "primes ≤ n = ${primes.joinToString(", ").ifEmpty { "—" }}",
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+        Text(
+            text = "via C++ callback: " + (firstThree
+                .joinToString(", ") { "#${it.index}=${it.value}" }
+                .ifEmpty { "—" }),
             style = MaterialTheme.typography.bodyLarge,
             modifier = Modifier.padding(top = 4.dp)
         )

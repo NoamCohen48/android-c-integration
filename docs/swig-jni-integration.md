@@ -2,7 +2,9 @@
 
 This document explains how the native C++ library in `lib/` is called from the
 Compose app in `app/`, so that tapping a button runs C++ (`is_prime`,
-`primes_up_to`) on each tap.
+`primes_up_to`) on each tap. It also covers the two directions that are easy to
+get wrong: C++ calling **back into Kotlin** through a callback that carries a
+struct (§5), and getting the C++ library's **logs into logcat** (§6).
 
 ## The problem being solved
 
@@ -32,9 +34,10 @@ lives **with the library**, in `lib/bindings/java/`, not in the app:
 lib/bindings/java/
 ├── CMakeLists.txt      # SWIG generation + libmathutils_jni (+ optional jar)
 ├── mathutils.i         # the hand-written interface
+├── android_log.cpp     # Android only: C++ log records -> logcat (JNI_OnLoad)
 └── generated/          # git-ignored SWIG output
     ├── java/com/example/mathutils/*.java
-    └── cpp/mathutils_wrap.cxx
+    └── cpp/mathutils_wrap.{cxx,h}
 ```
 
 That project builds on its own — `cmake -S lib/bindings/java -B <build>` runs
@@ -67,8 +70,10 @@ symbols exist.
 
 The only hand-written file describing the binding. Key parts:
 
-- `%module MathNative` — names the generated Java classes `MathNative`
-  (static-method facade) and `MathNativeJNI` (raw `native` declarations).
+- `%module(directors="1") MathNative` — names the generated Java classes
+  `MathNative` (static-method facade) and `MathNativeJNI` (raw `native`
+  declarations). `directors="1"` additionally enables *cross-language
+  polymorphism*, i.e. C++ calling up into Java (see §5).
 - The `%{ ... %}` block `#include`s the four library headers **verbatim into the
   wrapper**, so the generated C++ can see the real declarations when it compiles.
 - `%include "std_vector.i"` + `%template(LongVector) std::vector<long long>;` —
@@ -98,6 +103,9 @@ Running `swig -c++ -java -package com.example.mathutils` produces:
 - `MathNative.java` — friendly `public static boolean is_prime(long n)` wrappers
   that call `MathNativeJNI`.
 - `LongVector.java` — the `List<Long>` proxy.
+- `PrimeEvent.java` — the callback struct, as a class with getters.
+- `PrimeObserver.java`, `Sink.java`, `ConsoleSink.java`, `Level.java` — the
+  director classes (§5) and the log enum (§6).
 - `mathutils_wrap.cxx` — ~865 lines of `extern "C"` functions named
   `Java_com_example_mathutils_MathNativeJNI_<method>` (the `1` in `is_1prime` is
   JNI's escaping of the underscore). Each converts JVM types to/from C++ types
@@ -117,10 +125,130 @@ replaced, only this one file changes.
 
 ### 4. The UI — `MainActivity.kt`
 
-`CounterScreen` holds `n`; each tap recomposes and calls `MathUtils.isPrime(n)`
-and `MathUtils.primesUpTo(n)`, so the displayed values are computed in C++. The
+`CounterScreen` holds `n`; each tap recomposes and calls `MathUtils.isPrime(n)`,
+`MathUtils.primesUpTo(n)` and `MathUtils.scanPrimes(n) { ... }` (the callback
+row), so the displayed values are computed in C++. The
 `LocalInspectionMode.current` guard skips the native calls in Android Studio's
 preview renderer (which has no `.so` and would throw `UnsatisfiedLinkError`).
+
+### 5. Callbacks — C++ calling into Kotlin (SWIG directors)
+
+Everything above goes Java -> C++. The other direction needs **directors**:
+`%feature("director")` on an abstract C++ class makes SWIG emit a hidden C++
+subclass whose virtual methods call the Java override through JNI. So a Kotlin
+object can *be* a C++ interface implementation.
+
+The library side (`lib/include/mathutils/primes/scan.hpp`) is ordinary C++:
+
+```cpp
+struct PrimeEvent { long long value, index, limit; double progress; };
+
+class PrimeObserver {
+public:
+    virtual bool on_prime(const PrimeEvent& event) = 0;   // false stops the scan
+    virtual void on_finished(long long count, bool stopped_early);
+};
+
+long long scan_primes(long long limit, PrimeObserver& observer);
+```
+
+`mathutils.i` adds one line per callback class:
+
+```swig
+%feature("director") mathutils::primes::PrimeObserver;
+%feature("director") mathutils::log::Sink;
+```
+
+and Kotlin subclasses the generated proxy (`MathUtils.scanPrimes` wraps this):
+
+```kotlin
+val observer = object : PrimeObserver() {
+    override fun on_prime(event: PrimeEvent): Boolean {
+        Log.d("demo", "prime ${event.value} at ${event.index}")
+        return event.index < 2          // false stops the scan in C++
+    }
+    override fun on_finished(count: Long, stopped_early: Boolean) { }
+}
+MathNative.scan_primes(30, observer)
+```
+
+The call path is the mirror image of the one at the top of this document:
+
+```
+MathNative.scan_primes(30, observer)
+  -> C++ mathutils::primes::scan_primes(...) runs the sieve
+    -> calls observer.on_prime(event) — a virtual call on the director
+      -> director's on_prime does jenv->CallStaticBooleanMethod(... on_prime ...)
+        -> the Kotlin override runs, returns false
+      <- director returns false to C++, the scan breaks out of its loop
+```
+
+**The struct needs nothing special.** SWIG wraps `PrimeEvent` as a Java class
+with getters; the director hands Kotlin a proxy that points at the C++ object
+for the duration of the call. Because that pointer dies when the call returns,
+`MathUtils.scanPrimes` copies the fields into a Kotlin `data class` before
+handing them to app code.
+
+Three things that bite people:
+
+- **Lifetime.** A director keeps a *weak* global reference to its Java peer.
+  Fine for an object passed into a call; an object C++ *stores* (the log `Sink`
+  below) must stay strongly referenced from Java, or GC collects it and the next
+  upcall has nothing to call. `MathUtils` keeps it in a field for that reason.
+- **Threads.** The upcall runs on whatever thread executes the C++; SWIG's
+  director attaches it to the JVM when needed. Here everything is synchronous on
+  the caller's thread, so the Compose code stays on the main thread — a real
+  long scan belongs on a background dispatcher.
+- **Exceptions.** SWIG 4.x checks for a pending JVM exception right after each
+  upcall and raises `Swig::DirectorException`; `mathutils.i` catches it at the
+  call site and calls `throwException(jenv)`, so a Kotlin exception thrown
+  inside `on_prime` comes back out of `scan_primes` as *the same* exception type
+  rather than a flattened `RuntimeException`.
+
+### 6. Logging — C++ records in logcat
+
+The library must not depend on Android, so it never calls `__android_log_print`.
+`mathutils/log.hpp` defines an abstract sink and the library writes to it:
+
+```cpp
+MATHUTILS_LOG(Info, "mathutils.scan", "reported " << count << " prime(s)");
+```
+
+With no sink installed, the library is silent and the message is never even
+formatted. The **Android adapter is one file**,
+`lib/bindings/java/android_log.cpp`, compiled into `libmathutils_jni.so` only
+`if(ANDROID)`:
+
+```cpp
+class LogcatSink : public mathutils::log::Sink {
+    void write(Level level, const std::string& tag, const std::string& message) override {
+        __android_log_write(to_android_priority(level), tag.c_str(), message.c_str());
+    }
+};
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
+    mathutils::log::set_sink(&g_logcat_sink);
+    mathutils::log::set_min_level(mathutils::log::Level::Debug);
+    return JNI_VERSION_1_6;
+}
+```
+
+`JNI_OnLoad` is called by the JVM the moment `System.loadLibrary` maps the
+library — before any wrapped function can run — so logging is live from the
+first call, needs no Kotlin setup, and works on threads that have no Java frame.
+`__android_log_write` is the NDK's documented logcat entry point and is
+thread-safe; nothing goes through the JVM, so a log call costs no JNI
+transition. In Logcat, filter by the library's own tags:
+
+```sh
+adb logcat -s mathutils mathutils.scan
+```
+
+If the records should instead go somewhere the JVM owns (Timber, Crashlytics, an
+in-app log screen), install a Java sink — `mathutils::log::Sink` is a director
+too, so `MathUtils.routeNativeLogsToJava()` subclasses it in Kotlin and forwards
+to `android.util.Log`. That replaces the native sink; prefer the native one
+unless you need the JVM.
 
 ## Build orchestration
 
@@ -318,6 +446,9 @@ cannot drift.
 | ------------------------------------------------------------- | --------------------------------------------------------------- |
 | `lib/bindings/java/mathutils.i`                               | SWIG interface (the only hand-written binding description)       |
 | `lib/bindings/java/CMakeLists.txt`                            | Runs SWIG (standalone) and builds `libmathutils_jni.so` + `lib/` |
+| `lib/bindings/java/android_log.cpp`                           | Installs the logcat sink from `JNI_OnLoad` (Android only)        |
+| `lib/include/mathutils/log.hpp`, `lib/src/log.cpp`            | The library's host-agnostic logging facade                       |
+| `lib/include/mathutils/primes/scan.hpp`                       | `scan_primes` + the `PrimeObserver` callback and `PrimeEvent`    |
 | `lib/bindings/java/README.md`                                 | Building the binding without Android                             |
 | `app/app/build.gradle.kts`                                    | `generateSwig` task, NDK/CMake config, source set, task ordering |
 | `app/app/src/main/java/com/example/composebuttondemo/MathUtils.kt` | Idiomatic Kotlin facade over the SWIG proxies              |

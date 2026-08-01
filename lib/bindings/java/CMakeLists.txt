@@ -69,7 +69,14 @@ endif()
 # mark it as such: the configure step must succeed before the file exists.
 set_source_files_properties(${MATHUTILS_JAVA_WRAP_CXX} PROPERTIES GENERATED TRUE)
 
-add_library(mathutils_jni SHARED ${MATHUTILS_JAVA_WRAP_CXX})
+# android_log.cpp routes the library's log records to logcat from JNI_OnLoad;
+# it is the only Android-specific file here, so it is only compiled for Android.
+set(MATHUTILS_JNI_SOURCES ${MATHUTILS_JAVA_WRAP_CXX})
+if(ANDROID)
+    list(APPEND MATHUTILS_JNI_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/android_log.cpp)
+endif()
+
+add_library(mathutils_jni SHARED ${MATHUTILS_JNI_SOURCES})
 
 # Linking mathutils propagates its public include dirs and C++17 requirement.
 target_link_libraries(mathutils_jni PRIVATE mathutils::mathutils)
@@ -94,17 +101,21 @@ option(MATHUTILS_JAVA_BUILD_JAR "Compile the generated Java proxies into a jar" 
 
 if(MATHUTILS_JAVA_BUILD_JAR)
     find_package(Java 11 REQUIRED COMPONENTS Development)
-    include(UseJava)
 
-    # The .java files do not exist at configure time when SWIG runs as part of
-    # this build, so glob them at build time via a wildcard source directory.
-    add_jar(mathutils_java
-        SOURCES ${MATHUTILS_JAVA_OUT_DIR}/MathNative.java
-                ${MATHUTILS_JAVA_OUT_DIR}/MathNativeJNI.java
-                ${MATHUTILS_JAVA_OUT_DIR}/LongVector.java
-        OUTPUT_NAME mathutils)
+    # Not add_jar(): the .java files do not exist at configure time, so the file
+    # list is globbed by a script that runs during the build instead.
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/mathutils.jar
+        COMMAND ${CMAKE_COMMAND}
+                -DJAVA_SRC_DIR=${MATHUTILS_JAVA_GENERATED_DIR}/java
+                -DCLASSES_DIR=${CMAKE_BINARY_DIR}/java_classes
+                -DJAR_FILE=${CMAKE_BINARY_DIR}/mathutils.jar
+                -DJAVAC=${Java_JAVAC_EXECUTABLE}
+                -DJAR=${Java_JAR_EXECUTABLE}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_jar.cmake
+        DEPENDS ${MATHUTILS_JAVA_WRAP_CXX}
+        COMMENT "Compiling the generated Java proxies into mathutils.jar"
+        VERBATIM)
 
-    if(MATHUTILS_JAVA_RUN_SWIG)
-        add_dependencies(mathutils_java mathutils_java_swig)
-    endif()
+    add_custom_target(mathutils_java ALL DEPENDS ${CMAKE_BINARY_DIR}/mathutils.jar)
 endif()

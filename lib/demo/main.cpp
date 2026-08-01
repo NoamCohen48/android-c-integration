@@ -5,9 +5,43 @@
 
 namespace arith = mathutils::arithmetic;
 namespace comb = mathutils::combinatorics;
+namespace mlog = mathutils::log;  // not `log`: clashes with ::log(double)
 namespace primes = mathutils::primes;
 
+namespace {
+
+/// Callback for scan_primes(): prints the struct it is handed and stops the
+/// scan once it has seen enough primes. The Java binding does the same thing by
+/// subclassing PrimeObserver from Kotlin (see the Android app).
+class PrintingObserver : public primes::PrimeObserver {
+public:
+    explicit PrintingObserver(long long stop_after) : stop_after_(stop_after) {}
+
+    bool on_prime(const primes::PrimeEvent& event) override {
+        std::cout << "  on_prime{value=" << event.value << ", index=" << event.index
+                  << ", limit=" << event.limit << ", progress=" << event.progress << "}\n";
+        return event.index + 1 < stop_after_;
+    }
+
+    void on_finished(long long count, bool stopped_early) override {
+        std::cout << "  on_finished{count=" << count
+                  << ", stopped_early=" << std::boolalpha << stopped_early << "}\n";
+    }
+
+private:
+    long long stop_after_;
+};
+
+}  // namespace
+
 int main() {
+    // Send the library's log records somewhere. On Android the JNI bindings
+    // install a sink that forwards to logcat instead; the library itself never
+    // decides where logs go.
+    mlog::ConsoleSink console;
+    mlog::set_sink(&console);
+    mlog::set_min_level(mlog::Level::Debug);
+
     std::cout << "mathutils demo (v" << mathutils::version() << ")\n";
     std::cout << "=====================\n\n";
 
@@ -33,5 +67,11 @@ int main() {
     }
     std::cout << '\n';
 
+    std::cout << "primes::scan_primes(50, observer) — callback per prime:\n";
+    PrintingObserver observer(5);
+    const long long reported = primes::scan_primes(50, observer);
+    std::cout << "  -> scan_primes returned " << reported << '\n';
+
+    mlog::set_sink(nullptr);
     return 0;
 }

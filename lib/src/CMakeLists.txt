@@ -4,7 +4,9 @@
 add_library(mathutils
     arithmetic/basic.cpp
     combinatorics/factorial.cpp
+    log.cpp
     primes/primality.cpp
+    primes/scan.cpp
     primes/sieve.cpp)
 add_library(mathutils::mathutils ALIAS mathutils)
 
